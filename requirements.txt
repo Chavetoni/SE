@@ -1,0 +1,10 @@
+numpy>=1.20.0
+pandas>=1.3.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+gym>=0.21.0
+gymnasium>=0.28.1
+stable-baselines3>=1.5.0
+yfinance>=0.1.70
+torch>=1.10.0
+scikit-learn>=1.0.0
