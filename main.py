@@ -28,7 +28,7 @@ TEST_END_DATE = "2023-12-31"
 
 INITIAL_ACCOUNT_BALANCE = 10000
 LOOKBACK_WINDOW_SIZE = 20
-TRANSACTION_FEE_PERCENT = 0.001 # Standard trading fee
+TRANSACTION_FEE_PERCENT = 0.0001 # Standard trading fee
 
 # Position Size Limit
 MAX_POSITION_PERCENTAGE = 0.9 # Allow up to 90% exposure
@@ -440,6 +440,7 @@ class EnhancedStockTradingEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     def __init__(self, df, feature_groups, normalizer, # Normalizer should be passed fitted
+                 original_prices,
                  initial_balance=INITIAL_ACCOUNT_BALANCE,
                  lookback_window_size=LOOKBACK_WINDOW_SIZE,
                  transaction_fee_percent=TRANSACTION_FEE_PERCENT,
@@ -458,6 +459,9 @@ class EnhancedStockTradingEnv(gym.Env):
         self.allow_fractional_shares = allow_fractional_shares
         self.max_position_value_ratio = max_position_percentage
 
+        self.orig_prices = original_prices.copy()
+        self.orig_prices = self.orig_prices.reindex(self.df.index).ffill().bfill()
+
         # --- Store the correct Adj Close column name from the original data ---
         # This requires the original column structure info if df is already normalized
         # Let's infer it based on typical yfinance output structure
@@ -470,18 +474,6 @@ class EnhancedStockTradingEnv(gym.Env):
         # Let's revert: Assume df passed to env is NOT normalized yet. Normalize inside.
         # --- No, stick to passing normalized data as planned. Need price source. ---
         # --> Add original price series as an argument
-
-        # --> Simplest Fix for Now: Retrieve price from yfinance again inside env <<--
-        # --> NOT IDEAL, but avoids changing function signatures drastically      <<--
-        print("Env retrieving original price data for lookups...")
-        orig_data = yf.download(STOCK_TICKER, start=df.index.min(), end=df.index.max(), auto_adjust=False, progress=False)
-        if isinstance(orig_data.columns, pd.MultiIndex):
-             ticker = orig_data.columns.get_level_values('Ticker')[0]
-             self.adj_close_col_name = ('Adj Close', ticker)
-        else:
-             self.adj_close_col_name = 'Adj Close'
-        self.orig_prices = orig_data[self.adj_close_col_name] # Store original prices
-
 
         # Consolidate all features expected by the normalizer (simple names)
         self.all_features = []
@@ -667,10 +659,13 @@ class EnhancedStockTradingEnv(gym.Env):
 
                 shares_traded = shares_to_buy
                 cost = shares_to_buy * current_price
-                fee = cost * self.transaction_fee_percent
-                trade_cost = cost + fee
-                self.cash_in_hand -= trade_cost
+                fee = cost * self.transaction_fee_percent  # Calculate fee
+                total_spent = cost + fee  # Total cost including fee
+                self.cash_in_hand -= total_spent
                 self.shares_held += shares_to_buy
+                
+
+                self.trade_history.append((self.df.index[self.current_step_index], action_str, shares_traded, self.net_worth, fee))
             else:
                 action_str = 'HOLD (cannot afford/limit BUY)'
 
@@ -686,10 +681,12 @@ class EnhancedStockTradingEnv(gym.Env):
                 action_str = f'SELL {action_str_detail}'
                 shares_traded = -shares_to_sell
                 revenue = shares_to_sell * current_price
-                fee = revenue * self.transaction_fee_percent
-                trade_cost = fee
+                fee = revenue * self.transaction_fee_percent  # Calculate fee on revenue
                 self.cash_in_hand += revenue - fee
                 self.shares_held -= shares_to_sell
+
+                # Record only the fee in trade history
+                self.trade_history.append((self.df.index[self.current_step_index], action_str, shares_traded, self.net_worth, fee))
             else:
                 action_str = 'HOLD (nothing to SELL)'
 
@@ -705,10 +702,6 @@ class EnhancedStockTradingEnv(gym.Env):
         # Calculate reward
         reward = self.calculate_reward(previous_net_worth, self.net_worth)
 
-        # Record trade
-        if abs(shares_traded) > 1e-6:
-             current_date = self.df.index[self.current_step_index]
-             self.trade_history.append((current_date, action_str, shares_traded, self.net_worth, trade_cost))
 
         # Advance time step index
         self.current_step_index += 1
@@ -981,10 +974,14 @@ def evaluate_model_multiple_episodes(model, env_lambda, n_episodes=5):
 
     print(f"\n--- Evaluating Model over {n_episodes} Episodes ---")
 
+    base_seed = 42
+
     for i in range(n_episodes):
+        print(f"Starting evaluation epsisone {i+1}/{n_episodes} with seed {base_seed + i}")
+
         # Create a fresh environment for each evaluation episode
         eval_env = env_lambda() # Use lambda to create instance
-        obs, info = eval_env.reset()
+        obs, info = eval_env.reset(seed=base_seed + i)
         terminated = truncated = False
         ep_portfolio_values = [eval_env.initial_balance]
         ep_trades = 0
@@ -1086,6 +1083,10 @@ if __name__ == "__main__":
     if not all(col in data.columns for col in required_ohlcv):
          raise ValueError(f"Missing required OHLCV columns after potential flattening. Found: {data.columns}")
 
+    #Storing origanl prices before modifications
+    if 'Adj Close' not in data.columns:
+        raise ValueError("Missing 'Adj Close' column after loading/flattering.")
+    original_adj_close = data['Adj Close'].copy()
 
     # 2. Add Indicators
     print("Adding technical indicators...")
@@ -1093,6 +1094,30 @@ if __name__ == "__main__":
     data_with_indicators, feature_groups = add_indicators(data.copy())
     if data_with_indicators.empty:
          raise ValueError("DataFrame became empty after adding indicators. Check calculations/NaN handling.")
+    
+    # --- Split Data FIRST (for baseline) ---
+    train_data_full_features = data_with_indicators.loc[TRAIN_START_DATE:TRAIN_END_DATE].copy()
+    test_data_full_features = data_with_indicators.loc[TEST_START_DATE:TEST_END_DATE].copy()
+
+    # Filter date ranges strictly for the baseline splits
+    train_data_full_features = train_data_full_features[
+        (train_data_full_features.index >= TRAIN_START_DATE) & (train_data_full_features.index <= TRAIN_END_DATE)
+    ]
+    test_data_full_features = test_data_full_features[
+        (test_data_full_features.index >= TEST_START_DATE) & (test_data_full_features.index <= TEST_END_DATE)
+    ]
+
+    original_adj_close_train = original_adj_close.loc[train_data_full_features.index]
+    original_adj_close_test = original_adj_close.loc[test_data_full_features.index]
+
+    # --- Run Baseline HERE (using test_data_full_features) ---
+    print("\n--- Simulating MA Crossover (20/50) Baseline ---")
+    simulate_ma_crossover(
+        df_orig=test_data_full_features, # Use data BEFORE feature removal
+        short_window=20, long_window=50,
+        initial_balance=INITIAL_ACCOUNT_BALANCE,
+        fee_percent=TRANSACTION_FEE_PERCENT
+    )
 
     # --- Correlation Analysis & Feature Removal (using simple column names) ---
     print("\nPerforming Correlation Analysis...")
@@ -1108,6 +1133,11 @@ if __name__ == "__main__":
         upper_triangle = correlation_matrix.where(upper_triangle_mask)
         features_to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > CORRELATION_THRESHOLD)]
 
+        baseline_required_features = ['SMA_20', 'SMA_50']
+        baseline_required_features = [f for f in baseline_required_features if f in data_with_indicators.columns]
+        features_to_drop = [f for f in features_to_drop if f not in baseline_required_features]
+        print(f"Preserved {len(baseline_required_features)} features required for baseline comparison")
+            
         if features_to_drop:
             print(f"Removing {len(features_to_drop)} highly correlated features (Threshold > {CORRELATION_THRESHOLD}): {features_to_drop}")
             # Remove from the main dataframe being used going forward
@@ -1148,11 +1178,13 @@ if __name__ == "__main__":
     # 5. Create Environments using NORMALIZED data
     train_env_lambda = lambda: EnhancedStockTradingEnv(
         normalized_train_data, feature_groups, normalizer, # Pass fitted normalizer
+        original_prices= original_adj_close_train,
         reward_params=REWARD_SCALING, allow_fractional_shares=True,
         max_position_percentage=MAX_POSITION_PERCENTAGE
     )
     test_env_lambda = lambda: EnhancedStockTradingEnv(
         normalized_test_data, feature_groups, normalizer, # Pass same normalizer
+        original_prices= original_adj_close_test,
         reward_params=REWARD_SCALING, allow_fractional_shares=True,
         max_position_percentage=MAX_POSITION_PERCENTAGE
     )
@@ -1239,15 +1271,6 @@ if __name__ == "__main__":
     print("Rendering trading activity...")
     final_eval_env.render(mode='human')
     # Metrics are printed inside render call now
-
-    # 12. Simulate MA Crossover Baseline
-    # Needs the original test data with indicators added, before normalization
-    simulate_ma_crossover(
-        df_orig=test_data, # Pass test_data *before* normalization (but after indicators/corr removal)
-        short_window=20, long_window=50,
-        initial_balance=INITIAL_ACCOUNT_BALANCE,
-        fee_percent=TRANSACTION_FEE_PERCENT
-    )
 
     print("\nEvaluation complete.")
 
